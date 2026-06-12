@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "paygate-mcp"
+version = "0.1.0"
+description = "MCP server — lets AI assistants (Claude, etc.) create and check PayGate USDT payments"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "PayGate" }]
+keywords = ["mcp", "usdt", "bep20", "payments", "crypto", "paygate", "claude"]
+dependencies = [
+    "mcp>=1.0.0",
+    "paygate-python @ git+https://github.com/usdt-paygate/paygate-python.git",
+]
+
+[project.scripts]
+paygate-mcp = "paygate_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/usdt-paygate/paygate-mcp"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/paygate_mcp"]
