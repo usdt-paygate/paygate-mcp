@@ -88,6 +88,16 @@ MULTI-WALLET PAYMENTS:
 - For underpaid + expired: each sender gets their own refund record.
 - For overpaid: FIFO routing — the sender who tipped over 100% gets their
   excess portion back. Merchant initiates via Dashboard → Transactions.
+
+REFUND API (multi-tenant platforms):
+- list_refunds: query refunds by status, type, invoice_id, date range.
+- approve_refund / decline_refund: programmatic approval/decline.
+- get_refund_settings / update_refund_settings: per-type refund mode
+  (underpaid_mode + overpaid_mode independently). Recommended:
+  underpaid=auto, overpaid=manual.
+- Webhook events: refund.approved, refund.sent (the critical one — includes
+  on-chain txid), refund.declined, refund.failed. Same HMAC scheme as
+  invoice webhooks; discriminate by the 'event' field in the payload.
 """,
 )
 
@@ -354,6 +364,126 @@ def resume_payment(invoice_id: int) -> dict[str, Any]:
         return result
     except PaymentNotFound:
         return {"error": f"Invoice {invoice_id} not found", "status_code": 404}
+    except Exception as exc:
+        return {"error": str(exc)}
+    finally:
+        if client:
+            client.close()
+
+
+@mcp.tool()
+def list_refunds(
+    status: Optional[str] = None,
+    type: Optional[str] = None,
+    invoice_id: Optional[int] = None,
+    page: int = 1,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """
+    List refunds for the authenticated merchant with optional filters.
+
+    For multi-tenant platforms — automates refund management without dashboard access.
+
+    Args:
+        status:     pending | approved | declined | processing | sent | confirmed | failed | resumed
+        type:       underpaid | overpaid | manual
+        invoice_id: filter to a single invoice
+        page:       1-based, default 1
+        limit:      1-200, default 50
+
+    Returns:
+        count, page, limit, results (list of refund records)
+    """
+    client = None
+    try:
+        client = _client()
+        return client.list_refunds(
+            status=status, type=type, invoice_id=invoice_id,
+            page=page, limit=limit,
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+    finally:
+        if client:
+            client.close()
+
+
+@mcp.tool()
+def approve_refund(refund_id: int) -> dict[str, Any]:
+    """Approve a pending refund — queues it for the midnight batch.
+
+    When a customer's invoice expired with partial payment, openbcp auto-creates
+    a refund record. In manual mode it sits as PENDING until approved.
+    """
+    client = None
+    try:
+        client = _client()
+        return client.approve_refund(refund_id)
+    except Exception as exc:
+        return {"error": str(exc)}
+    finally:
+        if client:
+            client.close()
+
+
+@mcp.tool()
+def decline_refund(refund_id: int, reason: Optional[str] = None) -> dict[str, Any]:
+    """Decline a pending refund — moves it to the blacklist.
+
+    The customer must then contact merchant support directly. The refund
+    can still be restored from the blacklist later.
+
+    Args:
+        refund_id: the refund to decline
+        reason:    optional note for audit trail (e.g. "Customer requested credit instead")
+    """
+    client = None
+    try:
+        client = _client()
+        return client.decline_refund(refund_id, reason=reason)
+    except Exception as exc:
+        return {"error": str(exc)}
+    finally:
+        if client:
+            client.close()
+
+
+@mcp.tool()
+def get_refund_settings() -> dict[str, Any]:
+    """Read the merchant's per-type refund mode (underpaid vs overpaid)."""
+    client = None
+    try:
+        client = _client()
+        return client.get_refund_settings()
+    except Exception as exc:
+        return {"error": str(exc)}
+    finally:
+        if client:
+            client.close()
+
+
+@mcp.tool()
+def update_refund_settings(
+    underpaid_mode: Optional[str] = None,
+    overpaid_mode: Optional[str] = None,
+) -> dict[str, Any]:
+    """Update per-type refund mode. Each accepts 'auto' or 'manual'.
+
+    Recommended for platforms:
+      - underpaid → auto  (no debate, refund the customer)
+      - overpaid  → manual (may want to offer credit instead of paying gas)
+
+    Args:
+        underpaid_mode: 'auto' or 'manual' (or None to skip)
+        overpaid_mode:  'auto' or 'manual' (or None to skip)
+    """
+    client = None
+    try:
+        client = _client()
+        return client.update_refund_settings(
+            underpaid_mode=underpaid_mode,
+            overpaid_mode=overpaid_mode,
+        )
     except Exception as exc:
         return {"error": str(exc)}
     finally:

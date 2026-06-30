@@ -42,6 +42,11 @@ Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 | `get_payment(invoice_id)` | Full invoice details with all on-chain transactions and `is_paid` |
 | `check_payment_status(invoice_id)` | Quick status check with `amount_received`, `shortfall`, `overpaid_by`, and a plain-English summary |
 | `resume_payment(invoice_id)` | Resume an EXPIRED-with-partial invoice — creates a continuation invoice for the shortfall, reusing the same deposit address |
+| `list_refunds(status?, type?, invoice_id?, page?, limit?)` | List refunds with filters (for platform/SaaS merchants) |
+| `approve_refund(refund_id)` | Approve a pending refund — queues for the midnight batch |
+| `decline_refund(refund_id, reason?)` | Decline a pending refund — moves to blacklist |
+| `get_refund_settings()` | Read per-type refund mode (underpaid + overpaid) |
+| `update_refund_settings(underpaid_mode?, overpaid_mode?)` | Update per-type refund mode — each accepts 'auto' or 'manual' |
 
 ## What the AI assistant understands
 
