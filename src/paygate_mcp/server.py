@@ -26,6 +26,7 @@ Claude Desktop setup (~/.config/claude/claude_desktop_config.json):
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -37,19 +38,56 @@ mcp = FastMCP(
 You have access to an openbcp USDT BEP20 payment gateway via these tools.
 
 openbcp lets merchants accept USDT on Binance Smart Chain (BEP-20).
-Key facts:
-- Payments need 12 on-chain confirmations (~60 seconds after the tx lands)
-- Invoices expire after 24 hours by default
-- Status values: UNPAID → PARTIAL → PAID / OVERPAID (or EXPIRED)
-- PAID and OVERPAID both mean the merchant received sufficient funds
+
+KEY FACTS:
+- Payments need 3 on-chain confirmations by default (~9 seconds after the tx lands)
+- Invoices expire after the configured window (default 24 hours)
 - Always pass amount_usdt as a string (e.g. "29.99"), never a float
-- A platform fee is automatically added to the invoice amount
+- A platform fee is automatically added to the gross invoice amount
+
+PAYMENT STATUS LIFECYCLE:
+  UNPAID    → Waiting. No transaction detected yet.
+  PARTIAL   → A confirmed transaction exists but is below the required amount.
+              The checkout page shows the shortfall and prompts the customer to
+              top up to the same address. The expiry window auto-extends 30 min.
+              Do NOT fulfil the order — wait for PAID or OVERPAID.
+  PAID      → Full or near-full payment confirmed (98%–105% of expected).
+              Fulfil the order.
+  OVERPAID  → More than 105% of expected amount received. Fulfil the order.
+              The overpaid_by field tells you how much extra was sent.
+  EXPIRED   → Invoice timed out. If amount_received > 0, the customer sent
+              funds but didn't complete payment — consider issuing a refund.
+  CANCELLED → Customer cancelled manually. If amount_received > 0, a refund
+              may be needed.
+
+WEBHOOK PAYLOAD FIELDS (new in v2):
+  amount_received — total USDT confirmed on-chain for this invoice
+  shortfall       — how much more is needed (0.000000 when PAID/OVERPAID)
+  overpaid_by     — how much extra was sent (0.000000 when PAID/PARTIAL)
+
+RULE: Only fulfil orders when paid=true (status PAID or OVERPAID).
+      Never fulfil on PARTIAL — the payment is incomplete.
 
 Typical flow:
 1. create_payment → get payment_url
 2. Share payment_url with the customer — openbcp hosts the checkout page
 3. Customer scans QR or copies address, sends USDT on BSC
-4. Webhook fires to callback_url when confirmed, or use check_payment_status
+4. Webhook fires to callback_url on every status change
+5. Fulfil order only when webhook paid=true
+
+RESUME PAYMENT:
+- If a customer paid partially and the invoice expired, use resume_payment
+  instead of refunding. It creates a continuation invoice for the shortfall
+  reusing the same deposit address. When paid, the original invoice is
+  marked PAID via cascade and the webhook fires on the ORIGINAL invoice_id.
+- Idempotent: calling twice returns the existing continuation.
+
+MULTI-WALLET PAYMENTS:
+- A single invoice can receive payments from unlimited wallets.
+- Each transaction's from_address is tracked separately.
+- For underpaid + expired: each sender gets their own refund record.
+- For overpaid: FIFO routing — the sender who tipped over 100% gets their
+  excess portion back. Merchant initiates via Dashboard → Transactions.
 """,
 )
 
@@ -219,10 +257,33 @@ def check_payment_status(invoice_id: int) -> dict[str, Any]:
             confs = best.confirmations
             req = best.required_confirmations
 
+        received   = invoice.amount_received or invoice.total_confirmed
+        shortfall  = invoice.shortfall  or max(Decimal("0"), invoice.amount_usdt - received)
+        overpaid_by = invoice.overpaid_by or max(Decimal("0"), received - invoice.amount_usdt)
+
         if invoice.is_paid():
-            summary = f"Payment confirmed. Received {invoice.total_confirmed} USDT."
+            if invoice.payment_status == "OVERPAID":
+                summary = (f"Payment confirmed (overpaid by {overpaid_by} USDT). "
+                           f"Received {received} USDT, expected {invoice.amount_usdt} USDT. "
+                           "Fulfil the order and consider refunding the excess.")
+            else:
+                summary = f"Payment confirmed. Received {received} USDT. Fulfil the order."
+        elif invoice.is_partial():
+            summary = (f"Partial payment received: {received} USDT of "
+                       f"{invoice.amount_usdt} USDT required. "
+                       f"Still waiting for {shortfall} USDT more. "
+                       "Do NOT fulfil the order yet.")
         elif invoice.is_expired():
-            summary = "Invoice expired — no payment received in time."
+            if received > Decimal("0"):
+                summary = (f"Invoice expired. Customer sent {received} USDT but "
+                           f"the payment window closed. A refund of {received} USDT may be needed.")
+            else:
+                summary = "Invoice expired — no payment received."
+        elif invoice.is_cancelled():
+            if received > Decimal("0"):
+                summary = f"Order cancelled. {received} USDT was received — a refund may be needed."
+            else:
+                summary = "Order cancelled — no payment received."
         elif confs > 0:
             summary = f"Payment detected — waiting for confirmations ({confs}/{req})."
         else:
@@ -233,12 +294,64 @@ def check_payment_status(invoice_id: int) -> dict[str, Any]:
             "payment_status": invoice.payment_status,
             "is_paid": invoice.is_paid(),
             "amount_usdt": str(invoice.amount_usdt),
+            "amount_received": str(received),
+            "shortfall": str(shortfall),
+            "overpaid_by": str(overpaid_by),
             "expires_at": invoice.expires_at.isoformat() if invoice.expires_at else None,
             "transactions_count": len(invoice.transactions),
             "best_confirmations": confs,
             "required_confirmations": req,
             "summary": summary,
         }
+    except PaymentNotFound:
+        return {"error": f"Invoice {invoice_id} not found", "status_code": 404}
+    except Exception as exc:
+        return {"error": str(exc)}
+    finally:
+        if client:
+            client.close()
+
+
+@mcp.tool()
+def resume_payment(invoice_id: int) -> dict[str, Any]:
+    """
+    Resume an EXPIRED invoice with partial payment — creates a continuation
+    invoice for the shortfall amount only. Reuses the SAME deposit address
+    so the customer can pay via the old QR/URL OR the new payment_url.
+
+    WHEN TO USE: Customer paid partially, invoice expired, customer wants to
+    complete the payment (NOT refund). This avoids a refund/repurchase cycle.
+
+    Cascade behaviour:
+    - When the customer pays the continuation, the original invoice is
+      automatically marked PAID.
+    - Webhooks fire on the ORIGINAL invoice_id — merchant code doesn't change.
+    - Any pending refund records for the original invoice are cancelled.
+
+    Restrictions:
+    - Only works on invoices with status EXPIRED and amount_received > 0.
+    - Strictly per-tenant: can only resume your own invoices.
+
+    Args:
+        invoice_id: ID of the original EXPIRED invoice.
+
+    Returns:
+        continuation_invoice_id  — the new continuation invoice
+        original_invoice_id      — the original invoice (cascade target)
+        amount_usdt              — the shortfall (only what's still needed)
+        amount_already_received  — what the customer already paid
+        deposit_address          — same as the original invoice
+        payment_url              — share this with the customer
+        expires_at               — new expiry for the continuation
+        cancelled_refund_count   — refunds cancelled due to resume
+
+        If already resumed, returns resumed_existing: true (idempotent).
+    """
+    client = None
+    try:
+        client = _client()
+        result = client.resume_payment(invoice_id)
+        return result
     except PaymentNotFound:
         return {"error": f"Invoice {invoice_id} not found", "status_code": 404}
     except Exception as exc:
